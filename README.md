@@ -35,7 +35,10 @@ Think of it as your own little sysadmin utopia… but with more power and fewer 
 
 ## 🚀 Installation and Launch
 
-### 1️⃣ Clone the repository
+### 1️⃣ Clone & run 
 ```bash
-git clone https://github.com/<your-github-username>/rootopia.git
+git clone https://github.com/CodeD-Roger/Rootopia-.git
 cd rootopia
+sudo chmod +x rootopia.sh
+sudo ./rootopia.sh
+```
