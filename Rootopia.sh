@@ -4,21 +4,89 @@ export PATH=$PATH:/usr/sbin:/sbin
 # Script principal pour la gestion des services, utilisateurs, sécurité et sauvegardes
 
 # Variables globales
+VERSION="2.1.0"
+PROG="rootopia"
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")"
 LOG_FILE="/var/log/ecomanage.log"
 SNAPSHOT_DIR="/opt/ecomanage/snapshots"
 CONFIG_DIR="/opt/ecomanage/config"
 WEB_ROOT="/var/www"
 IPTABLES_RULES="/etc/iptables/rules.v4"
+# Email utilisé par certbot (surchargé par $ROOTOPIA_ADMIN_EMAIL)
+ADMIN_EMAIL="${ROOTOPIA_ADMIN_EMAIL:-admin@example.com}"
+
+# Drapeaux globaux (modifiables via les options de la CLI)
+ASSUME_YES=0   # -y/--yes : ne pas demander de confirmation
+QUIET=0        # -q/--quiet : ne pas afficher les logs INFO en console
+DRY_RUN=0      # --dry-run : afficher les actions sans les exécuter
+
+# Demander une confirmation (auto-validée avec -y/--yes ou en mode non-TTY+yes)
+# Usage: confirm "Message ?" && action
+confirm() {
+    local prompt="${1:-Confirmer ?}"
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        return 0
+    fi
+    # Pas de terminal interactif et pas de --yes : on refuse par sécurité
+    if [ ! -t 0 ]; then
+        log "ERROR" "Confirmation requise pour : $prompt (utilisez -y/--yes en non-interactif)"
+        return 1
+    fi
+    local answer
+    read -r -p "$prompt (yes/no) [no]: " answer
+    [ "$answer" = "yes" ] || [ "$answer" = "y" ]
+}
+
+# Valider un nom "sûr" (utilisateur, groupe, site, snapshot) :
+# uniquement lettres, chiffres, point, tiret et underscore — empêche l'injection de chemin.
+valid_name() {
+    [[ "$1" =~ ^[A-Za-z0-9._-]+$ ]] && [[ "$1" != "."* ]]
+}
+
+# Lire un secret sans l'afficher (depuis le terminal). Renvoie la valeur sur stdout.
+read_secret() {
+    local prompt="${1:-Mot de passe: }" secret
+    read -r -s -p "$prompt" secret </dev/tty
+    echo >&2
+    printf '%s' "$secret"
+}
+
+# Résout un mot de passe pour la CLI sans l'exposer dans `ps`.
+# Priorité : --password-stdin (lit une ligne sur stdin) > prompt masqué (si TTY) > --password.
+# $1 = valeur de --password ; $2 = flag stdin (1/0) ; $3 = libellé du prompt.
+# Émet le secret sur stdout (les messages vont sur stderr). Renvoie 1 si impossible.
+resolve_secret() {
+    local provided="$1" from_stdin="$2" prompt="${3:-Mot de passe: }" s
+    if [ "$from_stdin" -eq 1 ]; then
+        IFS= read -r s
+        printf '%s' "$s"
+        return 0
+    fi
+    if [ -t 0 ] && [ -z "$provided" ]; then
+        read_secret "$prompt"
+        return 0
+    fi
+    if [ -n "$provided" ]; then
+        log "WARN" "Mot de passe en clair sur la ligne de commande (visible dans 'ps') — préférez --password-stdin" >&2
+        printf '%s' "$provided"
+        return 0
+    fi
+    return 1
+}
 
 # Fonction pour journaliser les actions
 log() {
     local level="$1"
     local message="$2"
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
-    echo "[$timestamp] [$level] $message" >> "$LOG_FILE"
-    
-    # Afficher également dans la console si ce n'est pas silencieux
+    { echo "[$timestamp] [$level] $message" >> "$LOG_FILE"; } 2>/dev/null
+
+    # Afficher également dans la console si ce n'est pas silencieux.
+    # En mode --quiet, on masque uniquement les messages INFO (on garde WARN/ERROR).
     if [ "$3" != "silent" ]; then
+        if [ "$QUIET" -eq 1 ] && [ "$level" = "INFO" ]; then
+            return 0
+        fi
         echo "[$level] $message"
     fi
 }
@@ -54,7 +122,12 @@ check_dependencies() {
   
   if [ ${#missing_commands[@]} -ne 0 ]; then
     log "WARN" "Commandes manquantes: ${missing_commands[*]}"
-    
+
+    if ! confirm "Installer les paquets manquants (${missing_commands[*]}) ?"; then
+      log "ERROR" "Installation refusée — dépendances manquantes"
+      return 1
+    fi
+
     # Détection de la distribution
     if [ -f /etc/debian_version ]; then
       log "INFO" "Distribution Debian/Ubuntu détectée"
@@ -104,7 +177,8 @@ get_system_summary() {
     
     # Informations réseau
     local_ip=$(hostname -I | awk '{print $1}')
-    public_ip=$(curl -s https://api.ipify.org)
+    public_ip=$(curl -s --connect-timeout 3 --max-time 5 https://api.ipify.org)
+    [ -z "$public_ip" ] && public_ip="(indisponible)"
     
     # Vérifier si VPN est actif
     vpn_active="Non"
@@ -332,7 +406,13 @@ create_user() {
     local groups="$5"
     
     log "INFO" "Création de l'utilisateur: $username"
-    
+
+    # Valider le nom (évite l'injection et les noms invalides)
+    if ! valid_name "$username"; then
+        log "ERROR" "Nom d'utilisateur invalide: '$username'"
+        return 1
+    fi
+
     # Vérifier si l'utilisateur existe déjà
     if id "$username" &>/dev/null; then
         log "ERROR" "L'utilisateur $username existe déjà"
@@ -405,7 +485,12 @@ manage_group() {
     local members="$3"  # Optionnel, pour ajouter des membres
     
     log "INFO" "Gestion du groupe $groupname: $action"
-    
+
+    if ! valid_name "$groupname"; then
+        log "ERROR" "Nom de groupe invalide: '$groupname'"
+        return 1
+    fi
+
     case "$action" in
         create)
             groupadd "$groupname"
@@ -593,24 +678,52 @@ generate_wireguard_client() {
     local server_pubkey="$2"
     local server_endpoint="$3"
     local allowed_ips="$4"
-    
+    local client_address="$5"   # optionnel : IP fixe du client (ex 10.0.0.5)
+
     log "INFO" "Génération d'une configuration client WireGuard pour $client_name..."
-    
+
+    if ! valid_name "$client_name"; then
+        log "ERROR" "Nom de client invalide: '$client_name'"
+        return 1
+    fi
+
     # Créer le répertoire pour les clients
     mkdir -p "/etc/wireguard/clients"
-    
+
+    # Empêcher l'écrasement d'un client existant
+    if [ -f "/etc/wireguard/clients/${client_name}.conf" ]; then
+        log "ERROR" "Le client $client_name existe déjà"
+        return 1
+    fi
+
+    # Allouer une IP libre dans 10.0.0.0/24 si non fournie
+    local subnet="10.0.0"
+    local client_ip="$client_address"
+    if [ -z "$client_ip" ]; then
+        local last=1   # .1 = serveur
+        local f ip n
+        for f in /etc/wireguard/clients/*.conf; do
+            [ -e "$f" ] || continue
+            ip=$(grep -E '^Address' "$f" | grep -oE '10\.0\.0\.[0-9]+' | head -1)
+            n="${ip##*.}"
+            if [ -n "$n" ] && [ "$n" -gt "$last" ]; then last="$n"; fi
+        done
+        client_ip="${subnet}.$((last + 1))"
+    fi
+
     # Générer les clés
     wg genkey | tee "/etc/wireguard/clients/${client_name}.key" | wg pubkey > "/etc/wireguard/clients/${client_name}.pub"
-    
+    chmod 600 "/etc/wireguard/clients/${client_name}.key"
+
     # Récupérer les clés
     client_privkey=$(cat "/etc/wireguard/clients/${client_name}.key")
     client_pubkey=$(cat "/etc/wireguard/clients/${client_name}.pub")
-    
+
     # Créer le fichier de configuration client
     cat > "/etc/wireguard/clients/${client_name}.conf" << EOF
 [Interface]
 PrivateKey = ${client_privkey}
-Address = 10.0.0.2/24
+Address = ${client_ip}/24
 DNS = 8.8.8.8, 8.8.4.4
 
 [Peer]
@@ -619,13 +732,14 @@ Endpoint = ${server_endpoint}:51820
 AllowedIPs = ${allowed_ips:-0.0.0.0/0}
 PersistentKeepalive = 25
 EOF
-    
-    # Ajouter le client au serveur
-    wg set wg0 peer "$client_pubkey" allowed-ips "10.0.0.2/32"
+
+    # Ajouter le client au serveur (avec son IP dédiée)
+    wg set wg0 peer "$client_pubkey" allowed-ips "${client_ip}/32"
     wg-quick save wg0
     
     log "INFO" "Configuration client WireGuard générée pour $client_name"
     echo "Configuration client sauvegardée dans /etc/wireguard/clients/${client_name}.conf"
+    echo "Adresse VPN attribuée: ${client_ip}/24"
     echo "Clé publique du client: $client_pubkey"
     
     return 0
@@ -640,18 +754,31 @@ view_logs() {
     local filter="$3"
     
     log "INFO" "Affichage des logs: $log_file (lignes: $lines, filtre: $filter)"
-    
+
+    # Source des logs : fichier si présent, sinon bascule sur journalctl
+    # (systèmes journald-only comme RHEL/Fedora n'ont pas /var/log/syslog).
+    local -a source_cmd
     if [ -f "$log_file" ]; then
-        if [ -n "$filter" ]; then
-            grep "$filter" "$log_file" | tail -n "$lines"
-        else
-            tail -n "$lines" "$log_file"
-        fi
+        source_cmd=(cat "$log_file")
+    elif command -v journalctl &>/dev/null; then
+        log "WARN" "Fichier $log_file introuvable — bascule sur journalctl"
+        case "$log_file" in
+            *auth.log) source_cmd=(journalctl -u ssh -u sshd --no-pager) ;;
+            *nginx*)   source_cmd=(journalctl -u nginx --no-pager) ;;
+            *vsftpd*)  source_cmd=(journalctl -u vsftpd --no-pager) ;;
+            *)         source_cmd=(journalctl --no-pager) ;;
+        esac
     else
-        log "ERROR" "Fichier de log non trouvé: $log_file"
+        log "ERROR" "Source de logs introuvable: $log_file (et journalctl absent)"
         return 1
     fi
-    
+
+    if [ -n "$filter" ]; then
+        "${source_cmd[@]}" 2>/dev/null | grep "$filter" | tail -n "$lines"
+    else
+        "${source_cmd[@]}" 2>/dev/null | tail -n "$lines"
+    fi
+
     return 0
 }
 
@@ -701,7 +828,12 @@ create_website() {
     local enable_ssl="$4"  # "yes" ou "no"
     
     log "INFO" "Création du site web: $site_name"
-    
+
+    if ! valid_name "$site_name"; then
+        log "ERROR" "Nom de site invalide: '$site_name'"
+        return 1
+    fi
+
     # Créer le répertoire du site
     mkdir -p "${document_root:-$WEB_ROOT/$site_name}"
     chown -R www-data:www-data "${document_root:-$WEB_ROOT/$site_name}"
@@ -738,7 +870,7 @@ EOF
     if [ "$enable_ssl" = "yes" ]; then
         # Utiliser Let's Encrypt si disponible, sinon générer un certificat auto-signé
         if command -v certbot &>/dev/null; then
-            certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "admin@example.com"
+            certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "$ADMIN_EMAIL"
         else
             # Générer un certificat auto-signé
             mkdir -p "/etc/nginx/ssl/$site_name"
@@ -802,7 +934,12 @@ delete_website() {
     local delete_files="$2"  # "yes" ou "no"
     
     log "INFO" "Suppression du site web: $site_name"
-    
+
+    if ! valid_name "$site_name"; then
+        log "ERROR" "Nom de site invalide: '$site_name'"
+        return 1
+    fi
+
     # Désactiver le site
     rm -f "/etc/nginx/sites-enabled/$site_name"
     
@@ -834,7 +971,12 @@ create_snapshot() {
     local encryption_password="$4"  # Optionnel
     
     log "INFO" "Création d'un snapshot: $snapshot_name"
-    
+
+    if ! valid_name "$snapshot_name"; then
+        log "ERROR" "Nom de snapshot invalide: '$snapshot_name'"
+        return 1
+    fi
+
     # Créer le répertoire pour le snapshot
     snapshot_dir="$SNAPSHOT_DIR/$snapshot_name-$(date +%Y%m%d-%H%M%S)"
     mkdir -p "$snapshot_dir"
@@ -847,13 +989,17 @@ create_snapshot() {
     cp -a /etc/iptables "$snapshot_dir/etc/"
     cp -a /etc/vsftpd.conf "$snapshot_dir/etc/" 2>/dev/null
     
-    # Sauvegarder les volumes Docker (ERPNext)
+    # Sauvegarder les volumes Docker (chaque volume monté individuellement en lecture seule)
     if command -v docker &>/dev/null; then
         mkdir -p "$snapshot_dir/docker"
         docker_volumes=$(docker volume ls -q)
         for volume in $docker_volumes; do
-            # Créer un tar des volumes Docker
-            docker run --rm --volumes-from $(docker ps -q) -v "$snapshot_dir/docker:/backup" busybox tar cvf "/backup/$volume.tar" "/var/lib/docker/volumes/$volume"
+            log "INFO" "Sauvegarde du volume Docker: $volume" "silent"
+            docker run --rm \
+                -v "${volume}:/volume:ro" \
+                -v "$snapshot_dir/docker:/backup" \
+                busybox tar czf "/backup/${volume}.tar.gz" -C /volume . \
+                || log "WARN" "Échec de la sauvegarde du volume $volume"
         done
     fi
     
@@ -966,13 +1112,16 @@ restore_snapshot() {
     
     # Restaurer les volumes Docker
     if [ -d "$snapshot_dir/docker" ] && command -v docker &>/dev/null; then
-        for tar_file in "$snapshot_dir/docker"/*.tar; do
+        for tar_file in "$snapshot_dir/docker"/*.tar.gz; do
             if [ -f "$tar_file" ]; then
-                volume_name=$(basename "$tar_file" .tar)
+                volume_name=$(basename "$tar_file" .tar.gz)
                 # Créer le volume s'il n'existe pas
                 docker volume inspect "$volume_name" >/dev/null 2>&1 || docker volume create "$volume_name"
-                # Restaurer les données
-                docker run --rm -v "$volume_name:/volume" -v "$(dirname "$tar_file"):/backup" busybox tar xf "/backup/$(basename "$tar_file")" -C /volume
+                # Restaurer les données (contenu à la racine du volume)
+                docker run --rm \
+                    -v "${volume_name}:/volume" \
+                    -v "$(dirname "$tar_file"):/backup" \
+                    busybox tar xzf "/backup/$(basename "$tar_file")" -C /volume
             fi
         done
     fi
@@ -1056,6 +1205,189 @@ upload_snapshot() {
     fi
 }
 
+# ===== MODULE: FAIL2BAN (ex ban2sec) =====
+
+# S'assurer que fail2ban est installé
+ensure_fail2ban() {
+    if command -v fail2ban-client &>/dev/null; then
+        return 0
+    fi
+
+    log "WARN" "fail2ban n'est pas installé"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "INFO" "[dry-run] Installation de fail2ban ignorée"
+        return 0
+    fi
+
+    log "INFO" "Installation de fail2ban..."
+    if [ -f /etc/debian_version ]; then
+        apt-get update && apt-get install -y fail2ban
+    elif [ -f /etc/redhat-release ]; then
+        yum install -y epel-release && yum install -y fail2ban
+    elif [ -f /etc/alpine-release ]; then
+        apk add --no-cache fail2ban
+    else
+        log "ERROR" "Distribution non reconnue. Installez fail2ban manuellement."
+        return 1
+    fi
+
+    if ! command -v fail2ban-client &>/dev/null; then
+        log "ERROR" "Échec de l'installation de fail2ban"
+        return 1
+    fi
+    systemctl enable --now fail2ban 2>/dev/null
+    log "INFO" "fail2ban installé et activé"
+    return 0
+}
+
+# Statut global de fail2ban
+fail2ban_status() {
+    ensure_fail2ban || return 1
+    log "INFO" "Statut fail2ban" "silent"
+
+    echo -e "\n===== FAIL2BAN ====="
+    if systemctl is-active --quiet fail2ban; then
+        echo "Service: ACTIF"
+    else
+        echo "Service: INACTIF"
+    fi
+
+    echo -e "\n== Vue d'ensemble =="
+    fail2ban-client status 2>/dev/null || echo "Impossible de récupérer le statut (service démarré ?)"
+    return 0
+}
+
+# Lister les jails actives
+fail2ban_list_jails() {
+    ensure_fail2ban || return 1
+    echo -e "\n===== JAILS FAIL2BAN ====="
+    local jails
+    jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed -E 's/^[^:]+:[ \t]*//' | tr ',' ' ')
+    if [ -z "$jails" ]; then
+        echo "Aucune jail active"
+        return 0
+    fi
+    for jail in $jails; do
+        echo -e "\n--- $jail ---"
+        fail2ban-client status "$jail" 2>/dev/null
+    done
+    return 0
+}
+
+# Lister les IP actuellement bannies (toutes jails ou une jail précise)
+fail2ban_banned() {
+    local target_jail="$1"
+    ensure_fail2ban || return 1
+
+    echo -e "\n===== IP BANNIES ====="
+    local jails
+    if [ -n "$target_jail" ]; then
+        jails="$target_jail"
+    else
+        jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed -E 's/^[^:]+:[ \t]*//' | tr ',' ' ')
+    fi
+
+    for jail in $jails; do
+        local banned
+        banned=$(fail2ban-client status "$jail" 2>/dev/null | grep "Banned IP list" | sed -E 's/^[^:]+:[ \t]*//')
+        printf "%-20s %s\n" "$jail" "${banned:-(aucune)}"
+    done
+    return 0
+}
+
+# Bannir une IP dans une jail
+fail2ban_ban() {
+    local ip="$1"
+    local jail="${2:-sshd}"
+
+    if [ -z "$ip" ]; then
+        log "ERROR" "IP requise pour le bannissement"
+        return 1
+    fi
+    ensure_fail2ban || return 1
+
+    # Vérifier que la jail existe avant d'agir
+    if [ "$DRY_RUN" -ne 1 ] && ! fail2ban-client status "$jail" &>/dev/null; then
+        log "ERROR" "Jail inexistante: $jail (voir '$PROG fail2ban jails')"
+        return 1
+    fi
+
+    log "INFO" "Bannissement de $ip dans la jail $jail"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "INFO" "[dry-run] fail2ban-client set $jail banip $ip"
+        return 0
+    fi
+    fail2ban-client set "$jail" banip "$ip"
+    return $?
+}
+
+# Débannir une IP (dans une jail, ou toutes les jails si non précisée)
+fail2ban_unban() {
+    local ip="$1"
+    local jail="$2"
+
+    if [ -z "$ip" ]; then
+        log "ERROR" "IP requise pour le débannissement"
+        return 1
+    fi
+    ensure_fail2ban || return 1
+
+    local jails
+    if [ -n "$jail" ]; then
+        jails="$jail"
+    else
+        jails=$(fail2ban-client status 2>/dev/null | grep "Jail list" | sed -E 's/^[^:]+:[ \t]*//' | tr ',' ' ')
+    fi
+
+    log "INFO" "Débannissement de $ip"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "INFO" "[dry-run] fail2ban-client unban $ip (jails: $jails)"
+        return 0
+    fi
+
+    local done=1
+    for j in $jails; do
+        if fail2ban-client set "$j" unbanip "$ip" 2>/dev/null; then
+            log "INFO" "$ip débannie de $j"
+            done=0
+        fi
+    done
+    return $done
+}
+
+# Activer une protection SSH par défaut (preset sécurisé)
+fail2ban_setup_ssh() {
+    ensure_fail2ban || return 1
+    local maxretry="${1:-5}"
+    local bantime="${2:-3600}"
+    local findtime="${3:-600}"
+
+    log "INFO" "Configuration de la jail sshd (maxretry=$maxretry, bantime=${bantime}s)"
+    if [ "$DRY_RUN" -eq 1 ]; then
+        log "INFO" "[dry-run] Écriture de /etc/fail2ban/jail.d/sshd.local"
+        return 0
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d
+    cat > /etc/fail2ban/jail.d/sshd.local << EOF
+[sshd]
+enabled  = true
+port     = ssh
+maxretry = $maxretry
+findtime = $findtime
+bantime  = $bantime
+EOF
+
+    systemctl restart fail2ban
+    if systemctl is-active --quiet fail2ban; then
+        log "INFO" "Jail sshd activée"
+        return 0
+    else
+        log "ERROR" "fail2ban n'a pas redémarré correctement"
+        return 1
+    fi
+}
+
 # ===== MENU INTERACTIF =====
 
 show_menu() {
@@ -1116,6 +1448,7 @@ security_menu() {
     echo "5. Sauvegarder les règles iptables"
     echo "6. Restaurer les règles iptables"
     echo "7. Gestion VPN (WireGuard)"
+    echo "8. Fail2ban (anti-brute force)"
     echo "0. Retour au menu principal"
     echo "======================================="
     echo -n "Choisissez une option: "
@@ -1176,19 +1509,7 @@ vpn_menu() {
 
 # ===== FONCTION PRINCIPALE =====
 
-main() {
-    # Vérifier les privilèges root
-    check_root
-    
-    # Créer les répertoires nécessaires
-    setup_directories
-    
-    # Vérifier et installer les dépendances
-    check_dependencies || {
-        log "ERROR" "Impossible de continuer sans les dépendances requises"
-        exit 1
-    }
-    
+interactive_menu() {
     # Menu principal
     while true; do
         show_menu
@@ -1433,6 +1754,62 @@ main() {
                                 esac
                             done
                             ;;
+                        8)
+                            # Sous-menu Fail2ban
+                            while true; do
+                                clear
+                                echo "===== FAIL2BAN ====="
+                                echo "1. Statut global"
+                                echo "2. Lister les jails"
+                                echo "3. Lister les IP bannies"
+                                echo "4. Bannir une IP"
+                                echo "5. Débannir une IP"
+                                echo "6. Activer la protection SSH (preset)"
+                                echo "0. Retour"
+                                echo "===================="
+                                echo -n "Choisissez une option: "
+                                read -r f2b_choice
+                                case $f2b_choice in
+                                    1)
+                                        fail2ban_status
+                                        read -p "Appuyez sur Entrée pour continuer..."
+                                        ;;
+                                    2)
+                                        fail2ban_list_jails
+                                        read -p "Appuyez sur Entrée pour continuer..."
+                                        ;;
+                                    3)
+                                        read -p "Jail (vide = toutes): " jail
+                                        fail2ban_banned "$jail"
+                                        read -p "Appuyez sur Entrée pour continuer..."
+                                        ;;
+                                    4)
+                                        read -p "IP à bannir: " ip
+                                        read -p "Jail [sshd]: " jail
+                                        jail=${jail:-sshd}
+                                        fail2ban_ban "$ip" "$jail"
+                                        read -p "Appuyez sur Entrée pour continuer..."
+                                        ;;
+                                    5)
+                                        read -p "IP à débannir: " ip
+                                        read -p "Jail (vide = toutes): " jail
+                                        fail2ban_unban "$ip" "$jail"
+                                        read -p "Appuyez sur Entrée pour continuer..."
+                                        ;;
+                                    6)
+                                        fail2ban_setup_ssh
+                                        read -p "Appuyez sur Entrée pour continuer..."
+                                        ;;
+                                    0)
+                                        break
+                                        ;;
+                                    *)
+                                        echo "Option invalide"
+                                        sleep 1
+                                        ;;
+                                esac
+                            done
+                            ;;
                         0)
                             break
                             ;;
@@ -1545,12 +1922,12 @@ main() {
                             read -p "Nom du site: " site_name
                             read -p "Nom de serveur (domaine): " server_name
                             if command -v certbot &>/dev/null; then
-                                certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "admin@example.com"
+                                certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "$ADMIN_EMAIL"
                             else
                                 echo "Certbot non installé. Installation..."
                                 apt-get update
                                 apt-get install -y certbot python3-certbot-nginx
-                                certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "admin@example.com"
+                                certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "$ADMIN_EMAIL"
                             fi
                             read -p "Appuyez sur Entrée pour continuer..."
                             ;;
@@ -1644,15 +2021,17 @@ main() {
                                 chmod 600 "$CONFIG_DIR/backup_password"
                             fi
                             
-                            # Créer le script de sauvegarde
+                            # Créer le script de sauvegarde (appelle la CLI de Rootopia)
+                            local db_flag=""
+                            [ "$include_databases" = "no" ] && db_flag="--no-db"
                             cat > "$CONFIG_DIR/auto_backup.sh" << EOF
 #!/bin/bash
-source $(dirname "$0")/../ecomanage.sh
+# Généré par Rootopia — sauvegarde automatique
+SCRIPT="$SCRIPT_PATH"
 if [ "$encrypt" = "yes" ]; then
-    encryption_password=\$(cat "$CONFIG_DIR/backup_password")
-    create_snapshot "$snapshot_name" "$include_databases" "$encrypt" "\$encryption_password"
+    "\$SCRIPT" -y snapshot create --name "$snapshot_name" $db_flag --encrypt --password-stdin < "$CONFIG_DIR/backup_password"
 else
-    create_snapshot "$snapshot_name" "$include_databases" "no" ""
+    "\$SCRIPT" -y snapshot create --name "$snapshot_name" $db_flag
 fi
 EOF
                             chmod +x "$CONFIG_DIR/auto_backup.sh"
@@ -1696,6 +2075,460 @@ EOF
                 ;;
         esac
     done
+}
+
+# ===== INTERFACE EN LIGNE DE COMMANDE (CLI) =====
+
+# Sortie en erreur avec message
+die() {
+    log "ERROR" "$1"
+    exit "${2:-1}"
+}
+
+print_usage() {
+    cat << EOF
+Rootopia v$VERSION — Gestion Linux centralisée
+
+USAGE:
+    $PROG [OPTIONS] <module> <action> [arguments]
+    $PROG                       Lance le menu interactif
+    $PROG menu                  Lance le menu interactif
+
+OPTIONS GLOBALES:
+    -h, --help        Afficher cette aide
+    -V, --version     Afficher la version
+    -y, --yes         Confirmer automatiquement (indispensable en non-interactif)
+    -q, --quiet       Masquer les messages INFO
+        --dry-run     Simuler les actions sensibles sans les exécuter
+
+MODULES:
+    dashboard                          Résumé du système
+    service   <action> [service]       Services (systemd)
+    user      <action> [options]       Utilisateurs
+    group     <action> [args]          Groupes
+    firewall  <action> [args]          Pare-feu iptables
+    vpn       <action> [options]       VPN WireGuard
+    fail2ban  <action> [args]          Anti brute-force fail2ban
+    web       <action> [options]       Hébergement web nginx
+    snapshot  <action> [options]       Snapshots & sauvegardes
+    logs      <action> [args]          Logs & diagnostics
+
+Aide d'un module :  $PROG <module> --help
+
+EXEMPLES:
+    $PROG dashboard
+    $PROG service restart nginx
+    $PROG user create --name alice --password 's3cret' --groups sudo
+    $PROG firewall setup -y
+    $PROG fail2ban ban 203.0.113.7 sshd
+    $PROG snapshot create --name nightly --encrypt --password 'pass' -y
+EOF
+}
+
+# ---- service ----
+cmd_service() {
+    local action="$1"; shift 2>/dev/null
+    case "$action" in
+        ""|-h|--help|help)
+            echo "Usage: $PROG service <list|start|stop|restart|status|enable|disable|logs|config> [service]"
+            return 0 ;;
+        list) list_services ;;
+        start|stop|restart|status|enable|disable|logs)
+            [ -n "$1" ] || die "Nom du service requis: $PROG service $action <service>"
+            manage_service "$1" "$action" ;;
+        config)
+            [ -n "$1" ] || die "Nom du service requis: $PROG service config <service>"
+            edit_service_config "$1" ;;
+        *) die "Action service inconnue: $action" ;;
+    esac
+}
+
+# ---- user ----
+cmd_user() {
+    local action="$1"; shift 2>/dev/null
+    local name="" password="" home="" shell="" groups="" keep_home="no" password_stdin=0
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --password) password="$2"; shift 2 ;;
+            --password-stdin) password_stdin=1; shift ;;
+            --home) home="$2"; shift 2 ;;
+            --shell) shell="$2"; shift 2 ;;
+            --groups) groups="$2"; shift 2 ;;
+            --keep-home) keep_home="yes"; shift ;;
+            *) die "Option user inconnue: $1" ;;
+        esac
+    done
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG user list
+    $PROG user create --name N [--password P | --password-stdin] [--home DIR] [--shell SH] [--groups g1,g2]
+    $PROG user delete --name N [--keep-home]
+    $PROG user passwd --name N [--password P | --password-stdin]
+
+Mots de passe : préférez --password-stdin (echo 'secret' | $PROG ...) ou le
+prompt interactif. --password est accepté mais visible dans 'ps'.
+EOF
+            return 0 ;;
+        list) list_users ;;
+        create)
+            [ -n "$name" ] || die "--name requis"
+            password=$(resolve_secret "$password" "$password_stdin" "Mot de passe pour $name: ") \
+                || die "Mot de passe requis (--password, --password-stdin ou terminal interactif)"
+            create_user "$name" "$password" "$home" "$shell" "$groups" ;;
+        delete)
+            [ -n "$name" ] || die "--name requis"
+            confirm "Supprimer l'utilisateur $name ?" || die "Annulé"
+            delete_user "$name" "$keep_home" ;;
+        passwd)
+            [ -n "$name" ] || die "--name requis"
+            password=$(resolve_secret "$password" "$password_stdin" "Nouveau mot de passe pour $name: ") \
+                || die "Mot de passe requis (--password, --password-stdin ou terminal interactif)"
+            change_user_password "$name" "$password" ;;
+        *) die "Action user inconnue: $action" ;;
+    esac
+}
+
+# ---- group ----
+cmd_group() {
+    local action="$1"; shift 2>/dev/null
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG group create <nom>
+    $PROG group delete <nom>
+    $PROG group add <groupe> <user1,user2,...>
+    $PROG group remove <groupe> <user1,user2,...>
+EOF
+            return 0 ;;
+        create) [ -n "$1" ] || die "Nom du groupe requis"; manage_group "create" "$1" ;;
+        delete)
+            [ -n "$1" ] || die "Nom du groupe requis"
+            confirm "Supprimer le groupe $1 ?" || die "Annulé"
+            manage_group "delete" "$1" ;;
+        add)    [ -n "$2" ] || die "Usage: $PROG group add <groupe> <users>"; manage_group "add_members" "$1" "$2" ;;
+        remove) [ -n "$2" ] || die "Usage: $PROG group remove <groupe> <users>"; manage_group "remove_members" "$1" "$2" ;;
+        *) die "Action group inconnue: $action" ;;
+    esac
+}
+
+# ---- firewall ----
+cmd_firewall() {
+    local action="$1"; shift 2>/dev/null
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG firewall list
+    $PROG firewall setup            (réinitialise tout — preset sécurisé)
+    $PROG firewall save
+    $PROG firewall restore
+    $PROG firewall add <table> <chaine> <regle...>
+    $PROG firewall delete <table> <chaine> <numero>
+EOF
+            return 0 ;;
+        list)    list_iptables_rules ;;
+        save)    backup_iptables ;;
+        restore) restore_iptables ;;
+        setup)
+            confirm "Réinitialiser TOUTES les règles iptables et appliquer le preset ?" || die "Annulé"
+            setup_basic_firewall ;;
+        add)
+            local table="$1" chain="$2"; shift 2 2>/dev/null
+            [ -n "$table" ] && [ -n "$chain" ] && [ -n "$1" ] || die "Usage: $PROG firewall add <table> <chaine> <regle...>"
+            add_iptables_rule "$table" "$chain" "$*" ;;
+        delete)
+            [ -n "$3" ] || die "Usage: $PROG firewall delete <table> <chaine> <numero>"
+            delete_iptables_rule "$1" "$2" "$3" ;;
+        *) die "Action firewall inconnue: $action" ;;
+    esac
+}
+
+# ---- vpn ----
+cmd_vpn() {
+    local action="$1"; shift 2>/dev/null
+    local name="" server_pubkey="" endpoint="" allowed_ips="0.0.0.0/0" address=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --server-pubkey) server_pubkey="$2"; shift 2 ;;
+            --endpoint) endpoint="$2"; shift 2 ;;
+            --allowed-ips) allowed_ips="$2"; shift 2 ;;
+            --address) address="$2"; shift 2 ;;
+            *) die "Option vpn inconnue: $1" ;;
+        esac
+    done
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG vpn status
+    $PROG vpn up | down
+    $PROG vpn client-add --name N --server-pubkey K --endpoint E [--allowed-ips IPS] [--address 10.0.0.X]
+    $PROG vpn client-list
+    $PROG vpn client-revoke --name N
+
+Sans --address, une IP libre dans 10.0.0.0/24 est attribuée automatiquement.
+EOF
+            return 0 ;;
+        status) check_vpn_status ;;
+        up)     systemctl start wg-quick@wg0 && log "INFO" "VPN démarré" ;;
+        down)   systemctl stop wg-quick@wg0 && log "INFO" "VPN arrêté" ;;
+        client-add)
+            [ -n "$name" ] && [ -n "$server_pubkey" ] && [ -n "$endpoint" ] || die "--name, --server-pubkey et --endpoint requis"
+            generate_wireguard_client "$name" "$server_pubkey" "$endpoint" "$allowed_ips" "$address" ;;
+        client-list)
+            echo "Clients VPN configurés:"
+            ls -la /etc/wireguard/clients/ 2>/dev/null || echo "Aucun client trouvé" ;;
+        client-revoke)
+            [ -n "$name" ] || die "--name requis"
+            if [ -f "/etc/wireguard/clients/${name}.pub" ]; then
+                local pub; pub=$(cat "/etc/wireguard/clients/${name}.pub")
+                wg set wg0 peer "$pub" remove && wg-quick save wg0
+                rm -f "/etc/wireguard/clients/${name}".*
+                log "INFO" "Client $name révoqué"
+            else
+                die "Client non trouvé: $name"
+            fi ;;
+        *) die "Action vpn inconnue: $action" ;;
+    esac
+}
+
+# ---- fail2ban ----
+cmd_fail2ban() {
+    local action="$1"; shift 2>/dev/null
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG fail2ban status
+    $PROG fail2ban jails
+    $PROG fail2ban banned [jail]
+    $PROG fail2ban ban <ip> [jail=sshd]
+    $PROG fail2ban unban <ip> [jail]
+    $PROG fail2ban setup-ssh [maxretry=5] [bantime=3600] [findtime=600]
+EOF
+            return 0 ;;
+        status)    fail2ban_status ;;
+        jails)     fail2ban_list_jails ;;
+        banned)    fail2ban_banned "$1" ;;
+        ban)       [ -n "$1" ] || die "IP requise"; fail2ban_ban "$1" "$2" ;;
+        unban)     [ -n "$1" ] || die "IP requise"; fail2ban_unban "$1" "$2" ;;
+        setup-ssh) fail2ban_setup_ssh "$1" "$2" "$3" ;;
+        *) die "Action fail2ban inconnue: $action" ;;
+    esac
+}
+
+# ---- web ----
+cmd_web() {
+    local action="$1"; shift 2>/dev/null
+    local name="" root="" server_name="" ssl="no" purge="no"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --root) root="$2"; shift 2 ;;
+            --server-name) server_name="$2"; shift 2 ;;
+            --ssl) ssl="yes"; shift ;;
+            --purge) purge="yes"; shift ;;
+            *) die "Option web inconnue: $1" ;;
+        esac
+    done
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG web list
+    $PROG web create --name N [--root DIR] [--server-name DOMAINE] [--ssl]
+    $PROG web delete --name N [--purge]
+    $PROG web enable  --name N
+    $PROG web disable --name N
+    $PROG web ssl     --name N --server-name DOMAINE
+EOF
+            return 0 ;;
+        list)
+            echo "Sites disponibles:"; ls -1 /etc/nginx/sites-available/ 2>/dev/null
+            echo -e "\nSites activés:";  ls -1 /etc/nginx/sites-enabled/ 2>/dev/null ;;
+        create)
+            [ -n "$name" ] || die "--name requis"
+            create_website "$name" "$root" "$server_name" "$ssl" ;;
+        delete)
+            [ -n "$name" ] || die "--name requis"
+            confirm "Supprimer le site $name ${purge:+(et ses fichiers)} ?" || die "Annulé"
+            delete_website "$name" "$purge" ;;
+        enable)
+            [ -n "$name" ] || die "--name requis"
+            ln -sf "/etc/nginx/sites-available/$name" "/etc/nginx/sites-enabled/"
+            nginx -t && systemctl reload nginx && log "INFO" "Site $name activé" ;;
+        disable)
+            [ -n "$name" ] || die "--name requis"
+            rm -f "/etc/nginx/sites-enabled/$name"
+            systemctl reload nginx && log "INFO" "Site $name désactivé" ;;
+        ssl)
+            [ -n "$server_name" ] || die "--server-name requis"
+            if ! command -v certbot &>/dev/null; then
+                log "INFO" "Installation de certbot..."
+                apt-get update && apt-get install -y certbot python3-certbot-nginx
+            fi
+            certbot --nginx -d "$server_name" --non-interactive --agree-tos --email "$ADMIN_EMAIL" ;;
+        *) die "Action web inconnue: $action" ;;
+    esac
+}
+
+# ---- snapshot ----
+cmd_snapshot() {
+    local action="$1"; shift 2>/dev/null
+    local name="" file="" db="yes" encrypt="no" password="" password_stdin=0
+    local host="" user="" path="" key=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name) name="$2"; shift 2 ;;
+            --file) file="$2"; shift 2 ;;
+            --no-db) db="no"; shift ;;
+            --encrypt) encrypt="yes"; shift ;;
+            --password) password="$2"; shift 2 ;;
+            --password-stdin) password_stdin=1; shift ;;
+            --host) host="$2"; shift 2 ;;
+            --user) user="$2"; shift 2 ;;
+            --path) path="$2"; shift 2 ;;
+            --key) key="$2"; shift 2 ;;
+            *) die "Option snapshot inconnue: $1" ;;
+        esac
+    done
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG snapshot list
+    $PROG snapshot create  --name N [--no-db] [--encrypt (--password P | --password-stdin)]
+    $PROG snapshot restore --file F [--no-db] [--password P | --password-stdin]
+    $PROG snapshot upload  --file F --host H --user U --path P [--key K]
+
+Mots de passe : préférez --password-stdin ou le prompt interactif (--password
+est visible dans 'ps').
+EOF
+            return 0 ;;
+        list) echo "Snapshots disponibles:"; ls -la "$SNAPSHOT_DIR" 2>/dev/null ;;
+        create)
+            [ -n "$name" ] || die "--name requis"
+            if [ "$encrypt" = "yes" ]; then
+                password=$(resolve_secret "$password" "$password_stdin" "Mot de passe de chiffrement: ") \
+                    || die "Mot de passe requis avec --encrypt"
+            fi
+            create_snapshot "$name" "$db" "$encrypt" "$password" ;;
+        restore)
+            [ -n "$file" ] || die "--file requis"
+            if [[ "$file" == *.enc ]]; then
+                password=$(resolve_secret "$password" "$password_stdin" "Mot de passe de déchiffrement: ") \
+                    || die "Mot de passe requis pour un snapshot chiffré"
+            fi
+            confirm "Restaurer $file (écrase la configuration courante) ?" || die "Annulé"
+            restore_snapshot "$file" "$db" "$password" ;;
+        upload)
+            [ -n "$file" ] && [ -n "$host" ] && [ -n "$user" ] && [ -n "$path" ] || die "--file, --host, --user et --path requis"
+            upload_snapshot "$file" "$host" "$user" "$path" "$key" ;;
+        *) die "Action snapshot inconnue: $action" ;;
+    esac
+}
+
+# ---- logs ----
+cmd_logs() {
+    local action="$1"; shift 2>/dev/null
+    local lines=50 filter="" file=""
+    case "$action" in
+        ""|-h|--help|help)
+            cat << EOF
+Usage:
+    $PROG logs view <syslog|auth|nginx|ftp|FICHIER> [--lines N] [--filter STR]
+    $PROG logs diagnostics
+EOF
+            return 0 ;;
+        diagnostics) run_diagnostics; return 0 ;;
+        view)
+            local src="$1"; shift 2>/dev/null
+            while [[ $# -gt 0 ]]; do
+                case "$1" in
+                    --lines) lines="$2"; shift 2 ;;
+                    --filter) filter="$2"; shift 2 ;;
+                    *) die "Option logs inconnue: $1" ;;
+                esac
+            done
+            case "$src" in
+                syslog) file="/var/log/syslog" ;;
+                auth)   file="/var/log/auth.log" ;;
+                nginx)  file="/var/log/nginx/error.log" ;;
+                ftp)    file="/var/log/vsftpd.log" ;;
+                "")     die "Source requise: syslog|auth|nginx|ftp|FICHIER" ;;
+                *)      file="$src" ;;
+            esac
+            view_logs "$file" "$lines" "$filter" ;;
+        *) die "Action logs inconnue: $action" ;;
+    esac
+}
+
+# ===== POINT D'ENTRÉE =====
+
+main() {
+    # Analyse des options globales (avant le nom du module)
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)    print_usage; exit 0 ;;
+            -V|--version) echo "$PROG $VERSION"; exit 0 ;;
+            -y|--yes)     ASSUME_YES=1; shift ;;
+            -q|--quiet)   QUIET=1; shift ;;
+            --dry-run)    DRY_RUN=1; shift ;;
+            --)           shift; break ;;
+            -*)           die "Option globale inconnue: $1 (voir '$PROG --help')" ;;
+            *)            break ;;
+        esac
+    done
+
+    local module="$1"; shift 2>/dev/null
+
+    # Aide d'un module : accessible sans privilèges root
+    if [ "$1" = "-h" ] || [ "$1" = "--help" ] || [ "$1" = "help" ]; then
+        case "$module" in
+            service)         cmd_service ;;
+            user)            cmd_user ;;
+            group)           cmd_group ;;
+            firewall|fw)     cmd_firewall ;;
+            vpn)             cmd_vpn ;;
+            fail2ban|f2b)    cmd_fail2ban ;;
+            web)             cmd_web ;;
+            snapshot|backup) cmd_snapshot ;;
+            logs)            cmd_logs ;;
+            *)               print_usage ;;
+        esac
+        exit 0
+    fi
+
+    # Initialisation commune (droits + répertoires)
+    check_root
+    setup_directories
+
+    # Aucun module : menu interactif classique
+    if [ -z "$module" ] || [ "$module" = "menu" ]; then
+        check_dependencies || die "Impossible de continuer sans les dépendances requises"
+        interactive_menu
+        return
+    fi
+
+    case "$module" in
+        dashboard|status) get_system_summary ;;
+        service)          cmd_service "$@" ;;
+        user)             cmd_user "$@" ;;
+        group)            cmd_group "$@" ;;
+        firewall|fw)      cmd_firewall "$@" ;;
+        vpn)              cmd_vpn "$@" ;;
+        fail2ban|f2b)     cmd_fail2ban "$@" ;;
+        web)              cmd_web "$@" ;;
+        snapshot|backup)  cmd_snapshot "$@" ;;
+        logs)             cmd_logs "$@" ;;
+        help)             print_usage ;;
+        *)                die "Module inconnu: $module (voir '$PROG --help')" ;;
+    esac
 }
 
 # Exécuter la fonction principale si le script est exécuté directement
